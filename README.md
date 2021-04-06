@@ -4,3 +4,4 @@
 2. O R Markdown "descricao_metodo_v3.Rmd" contém os scripts e as explicações teóricas atinentes.
 3. O pdf "documentacao_codigo.pdf" contém a versão para impressão da metodologia de predição utilizada.
 4. As previsões estão no arquivo "tabela de previsões.csv".
+5. Contato: danusio.gadelhafilho@gmail.com
