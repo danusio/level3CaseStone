@@ -1,0 +1,1343 @@
+---
+title: "Descrição do Método"
+author: "Danusio Guimarães"
+date: "03/04/2021"
+output: bookdown::html_document2
+---
+
+# INTRODUÇÃO
+
+Este documento procura explicar a metodologia utilizada para a previsão de TPV proposta pelo Stone Data Challenge. A implementação foi feita na linguagem R, usando a IDE RStudio.
+
+A maior parte da Análise Exploratória dos Dados (EDA) será feita *inline* em cada passo de execução, e não em uma seção a parte, pois a EDA é normalmente utilizada para gerar *insights* e entender os dados, em um processo recorrente e iterativo. Todas as análises desse tipo estarão precedidas de **EDA**, para melhor legibilidade.
+
+Alguns procedimentos têm compilação demorada. Por isso, constam alguns comandos `load` carregando os resultados desses processos mais dispendiosos, com seu código gerador logo abaixo.
+
+```{r,echo=F}
+rm(list = ls())
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = F,
+                      warning = F,
+                      cache = T,
+                      comment = "> ")
+```
+
+# BIBLIOTECAS UTILIZADAS
+
+As bibliotecas utilizadas para executar os procedimentos são:
+
+- `fst`: permite manipular arquivos em formato .fst, que têm escrita e leitura mais rápidas que .csv;
+- `magrittr`: permite o uso do operador *pipe* (`%>%`);
+- `caret`: *framework* para contruir e testar modelos de *machine learning*;
+- `stringr`: permite manipular texto de uma forma rápida e intuitiva;
+- `modeest`: provê estimadores de moda estatística;
+- `parallel` e `doParallel`: permite computação *multithread* (o R, por padrão, só utiliza 1 núcleo de processamento);
+- `FSelector`: pacote para seleção de preditores;
+- `fastDummies`: permite a criação de variáveis binárias geradas a partir de preditores categóricos.
+- `factoextra`: usado para obter a "tendência de agrupamento" (o quão "agrupável" é o *dataset*) das observações.
+- `cluster`: usado para calcular a silhueta do agrupamento.
+- `clValid`: usado para calcular o Índice de Dunn do agrupamento.
+
+```{r}
+library(fst)
+library(magrittr)
+library(caret)
+library(caretEnsemble)
+library(stringr)
+library(modeest)
+library(parallel)
+library(doParallel)
+library(FSelector)
+library(fastDummies)
+library(factoextra)
+library(cluster)
+library(clValid)
+```
+
+```{r,echo=FALSE}
+library(kableExtra)
+```
+
+# FUNÇÕES AUXILIARES {#func-aux}
+
+Por sua recorrẽncia e/ou complexidade, alguns procedimentos foram transformados em funções:
+
+- `attrNA`: faz imputação de dados faltantes (`NA`) via regressão exponencial. Será aplicado aos dados temporais, utilizando como variável independentes da regressão linear um indexador ordinal (no caso em tela, será relativo ao mês do faturamento). Por exemplo, se os faturamentos disponíveis são:
+
+$$
+TPV = \{ JUL = 100, JUN=120,MAI=NA,ABR=110,MAR=150,FEV=80,JAN=NA \}
+$$
+
+Os valores de Maio e Janeiro serão estimados por uma regressão exponencial de `TPV ~ x={1,2,3,4,5,6,7}`, já que há 7 meses no total. No caso real, essa regressão será feita em um vetor de 1 a 37. A regressão exponencial foi escolhida por sua velocidade, fundamental dada a grande quantidade instâncias presentes, e pelo formato mais próximo à Normal dos TPV quando feita uma tranformação logarítmica (**EDA** - veja na seção \@ref(atrib-na)).
+
+A tranformação logarítmica proposta é a seguinte, que permite lidar com valores negativos:
+
+$$
+y_{log} = \ln \left( y - y_{min} + 1 \right)
+$$
+
+O valor $y_{log}$ será a variável dependente da regressão linear com o vetor $x = \{1,2,3...,37\}$.
+
+- `featSel`: faz a seleção de preditores combinando 3 metodologias: *oneR*, *information gain* e *Chi-squared*. Os valores de importância dados por cada metodologia comporão uma média e serão escolhidos aqueles atributos com média igual ou maior ao quantil 75% (25% maiores médias de importância). Além disso, o número de *features* foi limitado a 15, para evitar excesso de ajuste do modelo treinado.
+
+- `em` e `emProj`: permitem, repectivamente, calcular os valores ajustados de uma reressão exponencial e prjetar `n` valores à frente por meio de uma regressão exponencial.
+
+- `euclid`: calcula a distância euclidiana entre dois vetores.
+
+- `knnImp`: dado um número de vizinhos `k`, encontra as `k` observações mais próximas, dentre as observações sem *missing values*, de cada observação com valores faltantes, calcula a média ponderada pelo inverso da distância dessas `k` instâncias e substitui os valores `NA` pelos correspondentes nesse vetor de médias ponderadas. Retorna um `dataset` sem valores faltantes.
+
+```{r}
+transfLog <- function(x) log(x - min(x,na.rm = T)+1) %>% as.numeric
+```
+
+```{r}
+em <- function(y){
+  x <- 1:length(y)
+  ymin <- min(y,na.rm = T)
+  ymax <- max(y,na.rm = T)
+  
+  y1 <- transfLog(y)
+  
+  A <- cov(y1,x,use = "c")/var(x,na.rm = T)
+  b <- mean(y1,na.rm = T) - A*mean(x)
+  
+  yhat <- exp(A*x+b) + ymin - 1
+  
+  yhat
+}
+```
+
+```{r}
+emProj <- function(y,n){
+  if (sum(!is.na(y))==0) {
+    return(rep(NA,n))
+  }
+  
+  X <- 0:(1-n)
+  
+  x <- 1:length(y)
+  ymin <- min(y,na.rm = T)
+  ymax <- max(y,na.rm = T)
+  
+  y1 <- transfLog(y)
+  
+  A <- cov(y1,x,use = "c")/var(x,na.rm = T)
+  b <- mean(y1,na.rm = T) - A*mean(x)
+  
+  Y <- exp(A*X+b) + ymin - 1
+  
+  return(Y)
+}
+```
+
+```{r}
+attrNA <- function(y){
+  if (sum(!is.na(y))==0) {
+    return(y)
+  }
+  
+  out <- ifelse(is.na(y),em(y),y) %>% as.numeric
+} 
+```
+
+```{r}
+euclid <- function(x,Y){
+  dist <- NULL
+  for (i in 1:nrow(Y)) {
+    y <- Y[i,]
+    d <- ((x - y)^2) %>% sum(na.rm = T) %>% sqrt
+    dist <- c(dist,d)
+  }
+  
+  dist
+}
+```
+
+```{r}
+knnImp <- function(X,k){
+  X <- as.matrix(X)
+  N <- nrow(X)
+  comp_cases <- complete.cases(X)
+  
+  if (sum(comp_cases) == N) {
+    return(X)
+  }
+  
+  comp_inst <- (1:N)[complete.cases(X)]
+  
+  X1 <- X[comp_inst,]
+  
+  out <- NULL
+  for (i in 1:N) {
+    if (i %in% comp_inst) {
+      out <- rbind(out,X[i])
+    }else{
+      d <- euclid(X[i,],X1)
+      pos <- order(d)[1:k]
+      w <- matrix(1/d[pos],nrow = 1)/sum(1/d[pos])
+      
+      wavg <- (w %*% X1[pos,]) %>% as.numeric
+      
+      X_replace <- ifelse(is.na(X[i,]),
+                          wavg,X[i,])
+      out <- rbind(out,X_replace)
+    }
+  }
+  
+  out
+}
+```
+
+```{r}
+featSel <- function(df){
+  imp1 <- oneR(outcome ~ .,df)
+  imp2 <- information.gain(outcome ~ .,df)
+  imp3 <- chi.squared(outcome ~ .,df)
+  
+  feat_imp <- ((imp1+imp2+imp3)/3) %>%
+    apply(2,sort,decreasing=T)
+  
+  mi_imp <- quantile(feat_imp,0.75,names = F)
+  pred_sel <- rownames(feat_imp)[feat_imp[,1]>=mi_imp]
+  # limitação a 15 preditores
+  pred_sel <- pred_sel[1:min(15,length(pred_sel))]
+  
+  pred_sel
+}
+```
+
+# ETL DOS DADOS
+
+## Transformação de .csv para .fst
+
+```{r,eval=F}
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+#---------------------------------------------------\
+tpv_mes_csv <- read.csv("tpv-mensais-treinamento.csv")
+cadastro_csv <- read.csv("cadastrais.csv")
+
+write_fst(tpv_mes_csv,path = "tpv-mensais-treinamento.csv")
+write_fst(cadastro_csv,"cadastrais.fst")
+
+#---------------------------------------------------\
+
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+```
+
+## Carregamento dos Arquivos .fst
+
+```{r}
+tpv_mes <- read_fst("tpv-mensais-treinamento.fst")
+cadastro <- read_fst("cadastrais.fst")
+```
+
+```{r}
+# id's de clientes
+clientes <- unique(tpv_mes$id)
+```
+
+## Cadastro
+
+```{r}
+# variável de cópia, por segurança
+cad1 <- cadastro
+```
+
+- Tranformação da variável com o porte da empresa para "fator ordenado", já que existe uma relação entre as magnitudes de cada *level*. Além disso, o identificador de segmento MCC deve ser interpretado como um fator (variável categórica), não como um número:
+
+```{r}
+# porte com fator ordenado
+cad1$porte <- ordered(cadastro$porte,
+                      levels = c("0-2.5k","2.5k-5k","5k-10k",
+                                 "10k-25k","25k-50k",
+                                 "50k-100k","100k-500k","500k+"))
+# MCC como fator
+cad1$MCC <- as.factor(cad1$MCC)
+```
+
+- Eliminação de valores faltantes, provavelmente resultantes de erros de registro. Não podem ser eliminados, entretanto, se excluírem algum cliente da base de dados:
+
+```{r}
+# eliminação de NA's
+cad2 <- cad1 %>% na.omit
+cad2$tipo_documento <- cad2$tipo_documento %>% 
+  as.character %>% as.factor
+```
+
+Para checar se todos os clientes ainda constam na base `cad2`:
+
+```{r}
+# nº de clientes que não estão presentes na features 'id' de 'cad2'
+sum(!(clientes %in% cad2$id))
+```
+
+- Tranformação do atributo referente à data de inclusão do cliente na base de dados para formato de data. Além disso, eliminação da `feature` relativa à data da primeira transação, já que essa informação pode ser tirada dos dados de TPV da seção anterior:
+
+```{r}
+# mudança de formato de StoneCreatedDate
+cad2$StoneCreatedDate <- cad2$StoneCreatedDate %>% as.Date
+# eliminação de StoneFirstTransactionDate
+cad2$StoneFirstTransactionDate <- NULL
+```
+
+- Criação da variável `Ticket`, cuja informação está aglutinada no atributo `persona`. Separar essas duas informações pode facilitar a construção dos modelos de predição:
+
+```{r}
+# criação da variável Ticket
+tickets <- (cad2$persona %>% as.character %>% 
+  str_split(" ",simplify = T))[,6:7] %>% 
+  apply(1,paste0,collapse=" ")
+
+tickets[tickets == " "] <- "Outro"
+cad2$Ticket <- tickets %>% as.factor
+```
+
+```{r,echo=F}
+rm(tickets)
+```
+
+- Identificação e eliminação de múltiplas instâncias para a mesma ID de cliente, que deve ser única. Será contado o mais recente registro no banco de dados, exceto pelas variáveis `StoneCreateDate`, que usará o registro mais antigo, e `Estado`, que usará a moda dos registros. Neste último, caso haja empate de ocorrência, será escolhido o registro mais recente:
+
+```{r,echo=F}
+load("df_dupl.matrix")
+load("cont.vector")
+```
+
+```{r,eval=F}
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+# contagem de registros duplos
+df_dupl <- cont <- NULL
+for (i in 1:length(clientes)) {
+  s <- sum(cad2$id == clientes[i],na.rm = T)
+
+  if (s>1) {
+    cont <- c(cont,clientes[i])
+    # eliminação de registros duplos
+    df <- subset(cad2,id==clientes[i]) %>% unique
+    x <- tail(df,1)
+    x$StoneCreatedDate <- df$StoneCreatedDate[1]
+    x$Estado <- mfv(df$Estado) %>% tail(1)
+
+    df_dupl <- rbind(df_dupl,
+                     x)
+  }
+}
+
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+```
+
+```{r,echo=F}
+# save(df_dupl,file = "df_dupl.matrix")
+# save(cont,file = "cont.vector")
+```
+
+- Consolidação dos dados após a eliminação de instâncias múltiplas, com o posterior check de presença de todos os clientes na *data frame* final:
+
+```{r,eval=T}
+# instâncias relativas aos clientes em 'tpv_mes'
+cad3 <- cad2
+cad3 <- cad3[!(cad3$id %in% cont),]
+cad3 <- rbind(cad3,
+              df_dupl)
+cad3 <- cad3[cad3$id %in% clientes,]
+cad3 <- cad3[order(cad3$id),]
+
+cad3$MacroClassificacao <- as.character(cad3$MacroClassificacao)
+cad3$MacroClassificacao[cad3$MacroClassificacao == ""] <- "Outro"
+cad3$MacroClassificacao <- as.factor(cad3$MacroClassificacao)
+cad3$MCC <- as.factor(cad3$MCC)
+
+rm(cadastro,cad1,cad2)
+```
+
+```{r}
+sum(!(clientes %in% cad3$id))
+```
+
+```{r,echo=F}
+rm(df_dupl)
+```
+
+## Segmentação por Cluster
+
+Uso dos dados de cadastro para construir *clusters*, sobre os quais serão treinados os modelos. A hipótese aqui assumida é a de que reunir instâncias semelhantes otimiza o desempenho dos modelos treinados; a tarefa não-supervisionada foi escolhida por permitir o aparecimento de *clusters* mais "naturais" que aqueles contruídos manualmente, por macroclassificação ou tipo de documento, por exemplo.
+
+O algoritmo escolhido foi o kNN com distância euclidiana. 
+
+### Variáveis dummy para cadastro
+
+- (**EDA**) Nº de *levels* para cada *feature* do *dataset* `cad3`:
+
+```{r}
+cbind(names(cad3),
+      cad3 %>% sapply(class) %>% as.character)
+```
+
+À exceção de `id`, `StoneCreatedDate` e `TPVEstimate`, todos os preditores são fatores. A variável `porte` é um fator ordenado, e por isso é necessária sua transformação para apenas fator, a fim de extrair variáveis binárias:
+
+```{r}
+cad4 <- cad3
+cad4$porte <- cad3$porte %>% as.character %>% as.factor
+class(cad4$porte)
+```
+
+```{r,echo=F}
+rm(cad3)
+```
+
+É interessante verificar o número de `levels` de cada variável para definir a viabilidade de criar variáveis binárias a parte dela (muitas categorias torna desaconselhável esse processo):
+
+```{r}
+cad4[,-c(1,2,9)] %>% lapply(levels) %>% sapply(length,simplify = T)
+```
+
+`MCC` possui número excessivo de categorias, bem como `sub_segmento`. Entretanto, `Estado` deve apresentar inconsistência de registro, já que deve ser limitado a 27 categorias, no Brasil:
+
+```{r}
+levels(cad4$Estado)
+```
+
+Vamos verificar quais estados não estão representados por siglas:
+
+```{r}
+estados <- levels(cad4$Estado) %>% unique
+estados[str_count(estados)>2]
+```
+
+Goiás, Paraná e São Paulo estão com duas grafias:
+
+```{r}
+cad4$Estado <- str_replace_all(cad4$Estado %>% as.character,
+                               "Goias","Goiás") %>%
+  as.factor
+cad4$Estado <- str_replace_all(cad4$Estado %>% as.character,
+                               "Parana","Paraná") %>%
+  as.factor
+cad4$Estado <- str_replace_all(cad4$Estado %>% as.character,
+                               "Sao Paulo","São Paulo") %>%
+  as.factor
+
+estados <- levels(cad4$Estado) %>% unique
+estados[str_count(estados)>2]
+```
+
+Agora, basta substituir essas ocorrências por suas siglas:
+
+```{r}
+siglas <- c("AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG",
+            "PA","PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO")
+estados_ext <- estados[str_count(estados)>2] %>% as.character
+
+for (i in 1:length(siglas)) {
+  cad4$Estado <- str_replace_all(cad4$Estado %>% as.character,
+                               estados_ext[i],siglas[i]) %>%
+  as.factor
+}
+
+levels(cad4$Estado)
+```
+
+Resolvendo o problema de "MT do Sul", das letras minúsculas e dos valores faltantes:
+
+```{r}
+cad4$Estado <- str_replace_all(cad4$Estado %>% as.character,
+                               "MT do Sul","MS") %>%
+  casefold(upper = T) %>% as.factor
+
+cad4$Estado <- as.character(cad4$Estado)
+cad4$Estado[cad4$Estado==""] <- "unknown"
+cad4$Estado <- as.factor(cad4$Estado)
+
+summary(cad4$Estado) %>% sort(decreasing = T)
+```
+
+- Variável `segmento`:
+
+```{r}
+levels(cad4$segmento)
+```
+
+Em uma primeira abordagem, consideraremos que essa informação está abrangida por `Macroclassificação`. Os preditores não utilizados, até agora, para a criação das variáveis binárias são: 1,2,3,5,6 e 9.
+
+- Variável `persona`:
+
+```{r}
+levels(cad4$persona)
+```
+
+Consideraremos também que essas informações podem ser acessadas por outras *features*, adicionando a variável 7 à lista de não-utilizadas no processo de "dummyzation".
+
+- Variáveis *dummy*:
+
+```{r}
+cad_dummy <- dummy_cols(cad4[,-c(1:3,5:7,9)],
+                        remove_first_dummy = T,
+                        remove_selected_columns = T)
+names(cad_dummy)
+```
+
+No total, temos 47 variáveis binárias para o processo de agrupamento.
+
+## Agrupamento
+
+- Tendência de Agrupamento:
+
+(**EDA**) Avaliação da *tendência de agrupamento* dos dados por meio da estatística de Hopkins, que vai de 0 a 1. Quanto maior seu valor, mais *clusterizável* é o conjunto de dados, e o ideal é que fique acima de 0,5:
+
+```{r,echo=F}
+load("hpk.vector")
+```
+
+```{r,eval=F}
+nsamples <- 500
+ntry <- 20
+inst_tot <- 1:nrow(cad_dummy)
+
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+t0 <- Sys.time()
+hpk <- NULL
+for (i in 1:ntry) {
+  inst <- sample(inst_tot,size = nsamples+1,replace = F)
+  tend_cl <- get_clust_tendency(cad_dummy[inst,],n=nsamples)
+  hpk <- c(hpk,tend_cl$hopkins_stat)
+}
+t1 <- Sys.time()
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+```
+
+```{r,echo=F,eval=F}
+save(hpk,file = "hpk.vector")
+```
+
+```{r}
+c(media = mean(hpk),
+  desvio_padrao = sd(hpk))
+```
+
+Com a estatística Hopkins acima de 0.5, vamos aceitar a hipótese de que o *dataset* `cad_dummy` tem boa tendência a clusterização.
+
+- Nº ótimo de clusters: o critério será o maior valor da silhueta média do agrupamento. Abaixo, temos um exemplo para as primeiras 5000 instâncias, com o valor de silhueta plotado contra o número de grupos a serem gerados:
+
+```{r}
+# exemplo
+fviz_nbclust(cad_dummy[1:5000,],
+             FUNcluster = kmeans,
+             method = "silhouette",
+             k.max = 12,verbose = F)
+```
+
+A computação para determinar o nº ótimo de *clusters* é:
+
+```{r,echo=F}
+load("kopt.vector")
+load("max_silh.vector")
+```
+
+```{r,eval=F}
+nsamples <- 5000
+ntry <- 41
+inst_tot <- 1:nrow(cad_dummy)
+
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+t0 <- Sys.time()
+kopt <- max_silh <- NULL
+for (i in 1:ntry) {
+  inst <- sample(inst_tot,size = nsamples,replace = F)
+  optCl <- fviz_nbclust(cad_dummy[inst,],
+                        FUNcluster = kmeans,
+                        method = "silhouette",
+                        k.max = 12,verbose = F)$data
+  kopt <- c(kopt,
+            which.max(optCl[,2]))
+  max_silh <- c(max_silh,
+                max(optCl[,2]))
+
+}
+t1 <- Sys.time()
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+```
+
+```{r,echo=F,eval=F}
+save(kopt,file = "kopt.vector")
+save(max_silh,file = "max_silh.vector")
+```
+
+```{r}
+kopt
+```
+
+```{r}
+mean(kopt)
+```
+
+```{r}
+sd(kopt)
+```
+
+```{r}
+mean(max_silh)
+sd(max_silh)
+```
+Vemos uma clara convergência para o uso de 7 grupos, que será também o número de modelos a serem gerados para a predição de cada grupo.
+
+### K-means
+
+Modelagem para 7 grupos:
+
+```{r,echo=F}
+load("cl_model.list")
+```
+
+```{r}
+k <- 7
+```
+
+```{r,eval=F}
+cl_model <- kmeans(cad_dummy,7)
+```
+
+```{r,echo=F,eval=F}
+save(cl_model,file = "cl_model.list")
+```
+
+- Silhueta
+
+```{r,echo=F}
+load("sil_avg.vector")
+```
+
+```{r,eval=F}
+nsamples <- 10000
+ntry <- 20
+inst_tot <- 1:nrow(cad_dummy)
+
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+t0 <- Sys.time()
+sil_avg <- NULL
+for (i in 1:ntry) {
+  inst <- sample(inst_tot,size = nsamples,replace = F)
+  sil <- silhouette(cl_model$cluster[inst],dist(cad_dummy[inst,]))
+  sil_avg <- c(sil_avg,
+               mean(sil[, "sil_width"]))
+}
+t1 <- Sys.time()
+
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+```
+
+```{r,echo=F,eval=F}
+save(sil_avg,file = "sil_avg.vector")
+```
+
+```{r}
+mean(sil_avg)
+sd(sil_avg)
+```
+
+A silhueta média ficou em torno de 0,12. Vejamos outras medida de qualidade, o Índice de Dunn:
+
+```{r,echo=F}
+load("IDunn.vector")
+```
+
+```{r,eval=F}
+# ìndice de Dunn
+nsamples <- 5000
+ntry <- 41
+inst_tot <- 1:nrow(cad_dummy)
+
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+t0 <- Sys.time()
+IDunn <- NULL
+for (i in 1:ntry) {
+  inst <- sample(inst_tot,size = nsamples,replace = F)
+  ID <- dunn(Data = cad_dummy[1:nsamples,],
+              clusters = cl_model$cluster[1:nsamples])
+  IDunn <- c(IDunn,ID)
+}
+t1 <- Sys.time()
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+```
+
+```{r,echo=F,eval=F}
+save(IDunn,file = "IDunn.vector")
+```
+
+```{r}
+mean(IDunn)
+sd(IDunn)
+```
+
+```{r,echo=F}
+rm(cad_dummy)
+```
+
+- Relação entre a média intra e a média inter:
+
+```{r}
+mean(cl_model$withinss)/cl_model$betweenss
+```
+
+- Id's por grupo:
+
+```{r}
+grupos <- cl_model$cluster
+
+for (i in 1:k) {
+  print(sum(grupos==i))
+}
+```
+
+As medidas de qualidade não são as ideais, mas aceitaremos que essa divisão é mais próxima da otimalidade que uma segmentação arbitrária ou da não-segmentação (esta última ainda conta com o problema de um aumento quadrático de tempo de processamento).
+
+## Segmentação para treino
+
+As ID's de cada instância são armazenadas para posterior montagem dos *datasets* de treino e predição:
+
+```{r}
+id_cluster <- list()
+for (i in 1:k) {
+  id_cluster[[i]] <- cad4$id[which(grupos==i)]
+}
+```
+
+- Tranformação `porte` em fator ordenado novamente:
+
+```{r}
+# porte com fator ordenado
+cad4$porte <- ordered(cad4$porte,
+                      levels = c("0-2.5k","2.5k-5k","5k-10k",
+                                 "10k-25k","25k-50k",
+                                 "50k-100k","100k-500k","500k+"))
+```
+
+## EDA Básica
+
+- Tipos dos preditores
+
+```{r}
+tpv_mes %>% sapply(class,simplify = T)
+```
+
+Os dados de TPV são, naturalmente, numéricos. O mês de referência está, ainda, em um formato numérico. 
+
+```{r}
+cad4 %>% sapply(class,simplify = T)
+```
+
+Apenas o TPV estimado está em um formato numérico de fato, o que sugere a necessidade de criação de variáveis binárias para esses preditores categórigos. 
+
+- Distribuição dos Dados
+
+Vejamos a distribuição dos preditores aparentemente mais significativos:
+
+```{r}
+plot(cad4$MacroClassificacao,
+     main = "Macroclassificação")
+```
+
+```{r}
+summary(cad4$MacroClassificacao) %>% 
+  sort(decreasing = T)
+```
+
+Alimentação, Bens duráveis, Varejo e Serviços dominam os tipos de estabelecimentos.
+
+```{r}
+plot(cad4$porte,
+     main="Porte")
+```
+
+```{r}
+summary(cad4$porte) %>% 
+  sort(decreasing = T)
+```
+
+A maior parte das empresas tem um tamanho financeiro na faixa de 10 mil a 25 mil.
+
+```{r}
+summary(cad4$Estado) %>% 
+  sort(decreasing = T) %>% head(10)
+```
+
+São Paulo tem destacadamente a maior concentração de empresas do banco de dados.
+
+## TPV Mensais
+
+- Extração das ID's únicas de cliente:
+
+```{r}
+# variável de cópia, por segurança
+tpv1 <- tpv_mes
+# id's de clientes
+clientes <- unique(tpv_mes$id)
+```
+
+- Tranformação do mês de referência para formato de data:
+
+```{r}
+# mês de referência em formato de data
+tpv1$mes_referencia <-  tpv_mes$mes_referencia %>% 
+  as.character %>% as.Date(format = "%Y%m%d")
+```
+
+- Criação de uma *dataset* no formato atributo-valor com os dados temporais de TPV. Cada mês de referência será equivalente a uma *feature*, com os clientes como instâncias: 
+
+```{r,echo=F}
+load("M.matrix")
+```
+
+```{r,eval=F}
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+# destemporalização de tpv1
+datas <- unique(tpv1$mes_referencia) %>% sort(decreasing = T)
+M <- matrix(NA,ncol = length(datas),nrow = length(clientes))
+colnames(M) <- paste0("ref_",datas %>% as.character)
+rownames(M) <- clientes
+
+for (i in 1:ncol(M)) {
+  df <- subset(tpv1,mes_referencia == datas[i])
+  M[df$id %>% as.character,i] <- df$TPV_mensal
+}
+
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+```
+
+```{r,echo=F,eval=F}
+save(M,file = "M.matrix")
+```
+
+```{r}
+# consolidação
+tpv2 <- data.frame(id = clientes,
+                   M)
+```
+
+```{r,echo=F}
+rm(M,tpv_mes,tpv1)
+```
+
+### Atribuição de valores faltantes {#atrib-na}
+
+- função `knnImputation`:
+
+```{r,echo=F}
+load("tpv3.1.matrix")
+```
+
+```{r,eval=F}
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+ini_time <-  Sys.time()
+
+tpv3.1 <- ID <- NULL
+for (i in 1:k) {
+  ID <- c(ID,id_cluster[[i]])
+
+  subdf <- tpv2[tpv2$id %in% id_cluster[[i]],-1]
+  tpv3.1 <- rbind(tpv3.1,knnImp(subdf,k=5))
+}
+
+end_time <-  Sys.time()
+
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+
+tpv3.1 <- cbind(id = ID,
+                tpv3.1)
+rownames(tpv3.1) <- tpv3.1[,1] %>% as.character
+tpv3.1 <- tpv3.1[order(tpv3.1[,1]),]
+```
+
+```{r,echo=F,eval=F}
+save(tpv3.1,file = "tpv3.1.matrix")
+```
+
+```{r,echo=F}
+rm(subdf)
+```
+
+- função `attrNA`:
+
+```{r,echo=F}
+load("tpv3.2.matrix")
+```
+
+```{r,eval=F}
+tpv3.2 <- tpv2
+tpv3.2[,-1] <- tpv2[,-1] %>% apply(1,attrNA) %>% t
+```
+
+```{r,echo=F,eval=F}
+save(tpv3.2,file = "tpv3.2.matrix")
+```
+
+```{r,echo=F}
+rm(tpv2)
+```
+
+- Combinação das atribuições: para evitar um possível enviesamento dos modelos, e considerando que a imputação via kNN é mais acertada que a regressão exponencial, a combinação será uma média ponderada das duas imputações, com peso 70% para kNN e 30% para regressão exponencial:
+
+```{r}
+tpv3 <- 0.7*tpv3.1[,-1] + 0.3*tpv3.2[,-1]
+pos_na <- which(tpv3 %>% is.na,arr.ind = T)
+
+tpv3[pos_na] <- tpv3.1[pos_na]
+tpv3 <- tpv3 %>% data.frame
+tpv3 <- data.frame(id = clientes,
+                   tpv3)
+```
+
+```{r,echo=F}
+rm(tpv3.1,tpv3.2)
+```
+
+Observe-se a distribuição dos TPV para junho, citado na seção \@ref(func-aux). O uso do logaritmo reduz a curtose dos dados, permitindo uma melhor detecção das nuances:
+
+```{r,echo=F}
+hist(tpv3$ref_2020.06.30,main = "TPV 2020.06.30",xlab = "TPV")
+```
+
+```{r}
+hist(log(tpv3$ref_2020.06.30-min(tpv3$ref_2020.06.30,na.rm = T) + 1),
+     main = "log(TPV) 2020.06.30",xlab = "log(TPV)")
+```
+
+Esse padrão repete-se para os demais meses de referência.
+
+### Projeções de Preço
+
+Foram criadas variáveis contendo as projeções de TPV para os meses de agosto a dezembro de 2020, a fim de registrar uma tendência dos faturamentos. O método usado foi de regressão exponencial. 
+
+- Projeções para 5 meses:
+
+```{r,echo=F}
+load("proj.matrix")
+```
+
+```{r,eval=F}
+proj <- tpv3[,-1] %>% apply(MARGIN = 1,
+                            FUN = emProj,
+                            n=5) %>% t
+colnames(proj) <- paste0(c("ago","set","out","nov","dez"),"20")
+```
+
+```{r,echo=F,eval=F}
+save(proj,file = "proj.matrix")
+```
+
+Para incluir tais projeções no modelo, serão computadas as previsões para julho considerando os dados até junho (equivalente à projeção de agosto, distância de 1 mês), maio (equivalente à projeção de setembro, distância de 2 meses) e assim por diante.
+
+- Projeções para Julho 2020:
+
+```{r,echo=F}
+load("proj_tr.matrix")
+```
+
+```{r,eval=F}
+proj_tr <- cbind(
+  (tpv3[,-c(1:2)] %>% apply(MARGIN = 1,
+                            FUN = emProj,
+                            n=2) %>% t)[,1],
+  (tpv3[,-c(1:3)] %>% apply(MARGIN = 1,
+                            FUN = emProj,
+                            n=2) %>% t)[,2],
+  (tpv3[,-c(1:4)] %>% apply(MARGIN = 1,
+                            FUN = emProj,
+                            n=3) %>% t)[,3],
+  (tpv3[,-c(1:5)] %>% apply(MARGIN = 1,
+                            FUN = emProj,
+                            n=4) %>% t)[,4],
+  (tpv3[,-c(1:6)] %>% apply(MARGIN = 1,
+                            FUN = emProj,
+                            n=5) %>% t)[,5]
+)
+
+colnames(proj_tr) <- colnames(proj)
+```
+
+```{r,echo=F,eval=F}
+save(proj_tr,file = "proj_tr.matrix")
+```
+
+# MONTAGEM DOS DATASETS DE TREINO
+
+- Dataset com variáveis numéricas
+
+```{r}
+df_train_tpv <- data.frame(id = tpv3$id,
+                           jul20=NA,
+                           proj,
+                           tpv3[,-1])
+names(df_train_tpv)
+```
+
+```{r,echo=F}
+rm(tpv3)
+```
+
+- Variáveis de cadastro a serem incluídas no treinamento:
+
+```{r,echo=F}
+load("mip.vector")
+```
+
+```{r,eval=F}
+cad5 <- data.frame(outcome = df_train_tpv$ref_2020.07.31,
+                   dummy_cols(cad4[,-c(1:3,5:7)],
+                              remove_first_dummy = T,
+                              remove_selected_columns = T))
+
+mip <- featSel(cad5)
+```
+
+```{r,echo=F,eval=F}
+save(mip,file="mip.vector")
+```
+
+```{r}
+mip
+```
+
+```{r,echo=F}
+rm(cad5)
+```
+
+As variáveis `porte`, `tipo_documento` e `Ticket` tiveram todas as suas categorias incluídas nas variáveis mais preditivas do TPV de julho de 2020.  `TPVEstimate` também entrou no rol, mas `MacroClassificacao` teve menos da metade de suas categorias incluídas. Assim, podemos montar o *dataset* com variáveis categóricas da seguinte forma:
+
+```{r}
+df_train_cad <- cad4[,c("id", "TPVEstimate",
+                        "porte","Ticket","tipo_documento")]
+summary(df_train_cad)
+```
+
+```{r,echo=F}
+rm(cad4)
+```
+
+## Formatos para Treinamentos e Predições
+
+Para cada mês de previsão (agosto a dezembro de 2020), serão treinados modelos em um *dataset* com a seguinte composição:
+
+- *Outcome* equivalente aos TPV's de julho 2020;
+- A projeção, via regressão exponencial, para julho de 2020;
+- TPV's mensais, iniciando no mês $M-x$, onde $x$ é o nº de meses à frente que se deseja prever (para agosto, $x=1$, setembro, $x=2$, e assim por diante), sendo $M-0$ equivalente a julho 2020;
+- Dados cadastrais selecionados (porte, ticket e tipo de documento, além do TPV estimado).
+
+O modelo treinado será aplicado para previsão em um *dataset* com o seguinte formato:
+
+- A projeção, via regressão exponencial, para o mês em previsão;
+- Os TPV's mensais, excluindo-se os $x$ últimos, para manter o alcance máximo de 36 meses (a previsão para agosto 2020 não contará com o mês 37, para setembro 2020, com os meses 36 e 37, e assim por diante);
+- Dados cadastrais selecionados (porte, ticket e tipo de documento, além do TPV estimado).
+
+# TREINAMENTOS E PREDIÇÕES
+
+Para modelar os dados, foi escolhido um *ensemble* dos algoritmos `knn` e `glmnet` da `caret`. Suas predições seram combinadas usando o `gbm`. Os algoritmos do *ensemble* foram escolhidos por sua rapidez e bom desempenho geral. O algoritmo de combinação foi escolhido principalmente por sua robustez.
+
+Os dados passarão pelas seguintes etapas antes de alimentar o *framework* de treinamento:
+
+- A *feature* `jul20` receberá os dados das previsões para julho 2020 com os vários meses de diferença (até junho 2020 para a previsão de agosto - 1 mês de diferença, até maio 2020 para a previsão de setembro - 2 meses de diferença, e assim por diante).
+
+- Serão selecionadas as colunas correspondentes ao mês de julho 2020 e aos meses anteriores que serão usados como preditores. A esse *dataset*, será adicionado o conjunto de dados cadastrais.
+
+- Serão criadas variáveis binárias para os dados cadastrais.
+
+- Serão selecionadas as instâncias pertencentes a cada *cluster* gerado anteriormente. Para esses dados, serão escolhidas a variáveis preditoras, usando a função `predSel`.
+
+- Os dados serão, então, normalizados entre 0 e 1. Essa transformação não será aplicada ao *target* (TPV de julho 2020).
+
+A junção dos modelos kNN e GLM se dará com o objetivo de maximizar o coeficiente de determinação $R^2$. Essa estratégia foi escolhida para que o *ensemble* explique da melhor forma possível os dados. Já o treinamento do GBM se dará visando a minimizar o MAE. 
+
+```{r,echo=F}
+load("pred_full.matrix")
+```
+
+```{r,eval=F}
+meses <- c("ago","set","out","nov","dez")
+meses_ext <- c("agosto","setembro","outubro","novembro","dezembro")
+
+mae <- matrix(NA,ncol = k,nrow = 5)
+
+# computação em paralelo
+Mycluster = makeCluster(detectCores()-2,
+                        setup_strategy = "sequential")
+registerDoParallel(Mycluster)
+
+ini_time <-  Sys.time()
+
+list_modelos <- list()
+for (j in 1:5) {
+  t0 <- Sys.time()
+  
+  cat("\nMês ");cat(j);cat("\n-------------\n")
+  df_train_tpv$jul20 <- proj_tr[,paste0(meses[j],"20")]
+  
+  # Montagem do dataset de treino:
+  
+  if (j == 1) {
+    df0 <- cbind(df_train_tpv[,-c(1,3:7)],
+                 df_train_cad[,-1])
+  }else{
+    df0 <- cbind(df_train_tpv[,-c(1,3:7,9:(9+j-2))],
+                 df_train_cad[,-1])
+  }
+  
+  names(df0) <- c("proj.outcome",
+                  "outcome",
+                  paste0("M",j:36),
+                  names(df_train_cad)[-1])
+  
+  df0 <- dummy_cols(df0,remove_first_dummy = T,
+                    remove_selected_columns = T)
+  rownames(df0) <- clientes %>% as.character
+  
+  mod_norm <- preProcess(df0[,-2],
+                         method = "range",
+                         rangeBounds = c(0,1))
+  
+  # Separação dos *clusters* e modelagem:
+  
+  modelos <- list()
+  for (i in 1:k) {
+    cat("Grupo ");cat(i);cat("\n")
+    df1 <- df0[id_cluster[[i]] %>% as.character,]
+    
+    # feature selection
+    pred_sel <- featSel(df1)
+    
+    # normalização
+    df1 <- predict(mod_norm,df1)
+    
+    # transformação logarítmica
+    df2 <- df1[,c("outcome",pred_sel)]
+    
+    modelo_list <- caretList(outcome ~ .,
+                             df2,
+                             metric="Rsquared",
+                             trControl = trainControl(method = "repeatedcv",
+                                                      repeats = 3,
+                                                      number = 10,
+                                                      summaryFunction = defaultSummary),
+                             tuneList = list(
+                               glm = caretModelSpec(method = "glmnet"),
+                               knn = caretModelSpec(method = "knn",
+                                                    tuneGrid = expand.grid(k = 9))
+                             ))
+    
+    # ensembling ----
+    modelo_ensemb <- caretStack(modelo_list,
+                                method = "gbm",
+                                tuneGrid = expand.grid(shrinkage=0.1,
+                                                       interaction.depth=3,
+                                                       n.trees=200,
+                                                       n.minobsinnode=10),
+                                metric = "MAE",
+                                trControl = trainControl(method = "repeatedcv",
+                                                         number = 10,
+                                                         repeats = 3,
+                                                         summaryFunction = defaultSummary))
+    
+    mae[j,i] <- modelo_ensemb$ens_model$results[,"MAE"] %>% min
+    
+    modelos[[i]] <- modelo_ensemb
+    rm(df1,df2)
+  }
+  
+  list_modelos[[meses[j]]] <- modelos
+  
+  # Montagem do *dataset* de predição
+  
+  df2 <- cbind(df_train_tpv[,c(1,j+2,8:(44-j))],
+               df_train_cad[,-1])
+  
+  names(df2) <- c("id","proj.outcome",
+                  paste0("M",j:36),
+                  names(df_train_cad)[-1])
+  df2 <- dummy_cols(df2,remove_first_dummy = T,
+                    remove_selected_columns = T)
+  
+  # Predição
+  
+  pred_mes <- NULL
+  for (i in 1:k) {
+    df1 <- df2[df2$id %in% id_cluster[[i]],]
+    pred <- predict(modelos[[i]],
+                    predict(mod_norm,df1))
+    pred_mes <- rbind(pred_mes,
+                      cbind(df1$id,pred))
+  }
+  
+  pred_mes <- pred_mes[order(pred_mes[,1]),]
+  
+  rm(df0,df1,df2)
+  
+  if (j == 1) {
+    pred_full <- pred_mes
+  }else{
+    pred_full <- cbind(pred_full,pred_mes[,2])
+  }
+  
+  rm(pred_mes)
+  
+  t1 <- Sys.time()
+  cat("\nTempo de execução do mês: \n")
+  print(t1 - t0)
+}
+
+colnames(pred_full) <- c("id",paste0("TPV ",meses_ext))
+
+end_time <-  Sys.time()
+
+# setup inicial de processamento
+stopCluster(Mycluster)
+registerDoSEQ()
+
+cat("\n")
+print(end_time - ini_time)
+```
+
+```{r,eval=F,echo=F}
+save(list_modelos,file = "list_modelos.list")
+save(pred_full,file = "pred_full.matrix")
+save(mae,file="mae.matrix")
+```
+
+```{r,eval=F,echo=F}
+write.csv(pred_full,file = "tabela de previsões.csv",
+          row.names = F)
+```
+
+Vejamos como performaram os modelos durante os treinamentos:
+
+```{r,eval=F}
+colnames(mae) <- paste0("grupo_",1:7)
+rownames(mae) <- meses
+```
+
+```{r,echo=F,eval=F}
+save(mae,file = "mae.matrix")
+```
+
+```{r,echo=F}
+load("mae.matrix")
+```
+
+```{r}
+mae
+```
+
+Médias de MAE por grupo:
+
+```{r}
+colMeans(mae)
+```
+Fazendo uma média ponterada pelos tamanhos dos grupos, poderemos ter uma estimativa do MAE das previsões:
+
+```{r}
+sum(sapply(id_cluster,
+           length,
+           simplify = T)*colMeans(mae))/length(clientes)
+```
+
+```{r}
+df_train_tpv$ref_2020.07.31 %>% 
+  abs %>% 
+  mean
+```
+
+Em relação ao valor da média absoluta dos TPV's de julho, o MAE esperado ficou em torno de 30%, considerando todos os 5 meses de previsão.
+
+Médias de MAE por mês:
+
+```{r}
+rowMeans(mae)
+```
+
+Naturalmente, quanto mais distante a predição, maior o erro envolvido.
+
+(**EDA**) Observemos as distribuições e a sumarização das variações de TPV desde Julho:
+
+```{r}
+TPV_07_12 <- data.frame(TPV.julho = df_train_tpv$ref_2020.07.31,
+                        pred_full[,-1])
+
+var_tpv <- (TPV_07_12[,2:6]-TPV_07_12[,1:5])
+```
+
+```{r}
+summary(var_tpv)
+```
+
+Vejamos como se comportaram os dados reais em um período de 6 meses:
+
+```{r}
+TPV_02_07 <- data.frame(fevereiro = df_train_tpv$ref_2020.02.29,
+                        marco = df_train_tpv$ref_2020.03.31,
+                        abril = df_train_tpv$ref_2020.04.30,
+                        maio = df_train_tpv$ref_2020.05.31,
+                        junho = df_train_tpv$ref_2020.06.30,
+                        julho = df_train_tpv$ref_2020.07.31)
+
+var_tpv_real <- (TPV_02_07[,2:6]-TPV_02_07[,1:5])
+```
+
+```{r}
+summary(var_tpv_real)
+```
+
+A presença de valores negativos de TPV torna sem sentido uma variação percentual, mas podemos verificar uma coerência dimensional entre as variações dos dois períodos.
+
+# VARIÁVEIS POSSIVELMENTE ÚTEIS NA PREVISÃO
+
+- Fatores macroeconômicos, como inflação e taxa básica de juros: dado que o faturamento é profundamente impactado tanto pelo poder de compra da população quanto pela facilidade de acesso a crédito por parte do empresário, seria interessante adicionar preditores que descrevessem esse contexto.
+
+- Desempenho de empresas do setor na Bolsa de Valores: por conta da maior abundância de informações históricas e da ampla teoria já produzida a respeito de previsão de séries temporais financeiras, seria interessante realizar previsões para os setores (englobando os diversos ativos de cada setor) e incorporar tais previsões no modelo aqui requerido.
