@@ -63,7 +63,7 @@ library(kableExtra)
 
 # FUNÇÕES AUXILIARES {#func-aux}
 
-Por sua recorrẽncia e/ou complexidade, alguns procedimentos foram transformados em funções:
+Por sua recorrência e/ou complexidade, alguns procedimentos foram transformados em funções:
 
 - `attrNA`: faz imputação de dados faltantes (`NA`) via regressão exponencial. Será aplicado aos dados temporais, utilizando como variável independentes da regressão linear um indexador ordinal (no caso em tela, será relativo ao mês do faturamento). Por exemplo, se os faturamentos disponíveis são:
 
@@ -1081,7 +1081,11 @@ O modelo treinado será aplicado para previsão em um *dataset* com o seguinte f
 
 # TREINAMENTOS E PREDIÇÕES
 
-Para modelar os dados, foi escolhido um *ensemble* dos algoritmos `knn` e `glmnet` da `caret`. Suas predições seram combinadas usando o `gbm`. Os algoritmos do *ensemble* foram escolhidos por sua rapidez e bom desempenho geral. O algoritmo de combinação foi escolhido principalmente por sua robustez.
+Para modelar os dados, foi escolhido um *ensemble* dos algoritmos `knn` e `glmnet` da `caret`. Suas predições seram combinadas usando o `gbm`. Os algoritmos do *ensemble* foram escolhidos por sua rapidez e bom desempenho geral. 
+
+O algoritmo de combinação foi escolhido principalmente por sua robustez em diversos cenários, enquanto que o classificador kNN foi pensado ser adequado por basilar suas predições em similaridade de *features*. Ora, é razoável admitir que, se uma instância apresentou determinado comportamento em *x* meses anteriores, quanto mais próximo estiver o comportamento de outra instância *do mesmo cluster* (lembrando que os modelos são projetados para um determinado *cluster*), mais seu *target* se aproximará do primeiro.
+
+Já o `glmnet` foi escolhido por ser simples, rápido e eficaz, conforme pode ser verificado neste gráfico: [https://i.stack.imgur.com/jJuQd.png](https://i.stack.imgur.com/jJuQd.png). O estudo completo está em [https://mlr-org.com/docs/2016-08-11-benchmarking-mlr-learners-on-openml/](https://mlr-org.com/docs/2016-08-11-benchmarking-mlr-learners-on-openml/). Combinando esses dois modelos mais "fracos" com a robustez do GBM, espera-se ter um modelo mais preciso que consuma menos recursos computacionais.
 
 Os dados passarão pelas seguintes etapas antes de alimentar o *framework* de treinamento:
 
@@ -1097,6 +1101,8 @@ Os dados passarão pelas seguintes etapas antes de alimentar o *framework* de tr
 
 A junção dos modelos kNN e GLM se dará com o objetivo de maximizar o coeficiente de determinação $R^2$. Essa estratégia foi escolhida para que o *ensemble* explique da melhor forma possível os dados. Já o treinamento do GBM se dará visando a minimizar o MAE. 
 
+O treinamento será validado com uma *repeated cross-validation*, 3 repetições e 10 pastas. Serão analisados o *Mean Absolute Error* e o coeficiente de determinação dos 35 modelos gerados (5 meses de predição e 7 *clusters*).
+
 ```{r,echo=F}
 load("pred_full.matrix")
 ```
@@ -1105,7 +1111,7 @@ load("pred_full.matrix")
 meses <- c("ago","set","out","nov","dez")
 meses_ext <- c("agosto","setembro","outubro","novembro","dezembro")
 
-mae <- matrix(NA,ncol = k,nrow = 5)
+mae <- r2 <- matrix(NA,ncol = k,nrow = 5)
 
 # computação em paralelo
 Mycluster = makeCluster(detectCores()-2,
@@ -1157,7 +1163,6 @@ for (j in 1:5) {
     # normalização
     df1 <- predict(mod_norm,df1)
     
-    # transformação logarítmica
     df2 <- df1[,c("outcome",pred_sel)]
     
     modelo_list <- caretList(outcome ~ .,
@@ -1187,6 +1192,7 @@ for (j in 1:5) {
                                                          summaryFunction = defaultSummary))
     
     mae[j,i] <- modelo_ensemb$ens_model$results[,"MAE"] %>% min
+    r2[j,i] <- modelo_ensemb$ens_model$results[,"Rsquared"] %>% min
     
     modelos[[i]] <- modelo_ensemb
     rm(df1,df2)
@@ -1249,6 +1255,7 @@ print(end_time - ini_time)
 save(list_modelos,file = "list_modelos.list")
 save(pred_full,file = "pred_full.matrix")
 save(mae,file="mae.matrix")
+save(r2,file="r2.matrix")
 ```
 
 ```{r,eval=F,echo=F}
@@ -1259,16 +1266,15 @@ write.csv(pred_full,file = "tabela de previsões.csv",
 Vejamos como performaram os modelos durante os treinamentos:
 
 ```{r,eval=F}
-colnames(mae) <- paste0("grupo_",1:7)
+colnames(mae) <- paste0("grupo_",1:k)
 rownames(mae) <- meses
-```
-
-```{r,echo=F,eval=F}
-save(mae,file = "mae.matrix")
+colnames(r2) <- paste0("grupo_",1:k)
+rownames(r2) <- meses
 ```
 
 ```{r,echo=F}
 load("mae.matrix")
+load("r2.matrix")
 ```
 
 ```{r}
@@ -1302,7 +1308,33 @@ Médias de MAE por mês:
 rowMeans(mae)
 ```
 
-Naturalmente, quanto mais distante a predição, maior o erro envolvido.
+Naturalmente, quanto mais distante a predição, maior o erro envolvido. Para o $R^2$:
+
+```{r}
+r2
+```
+
+Médias de $R^2$ por grupo:
+
+```{r}
+colMeans(r2)
+```
+
+Fazendo uma média ponderada pelos tamanhos dos grupos, poderemos ter uma estimativa do $R^2$ das previsões:
+
+```{r}
+w <- sapply(id_cluster,length,simplify = T)/length(clientes)
+
+sum((w^2)*colMeans(r2))/sum(w^2)
+```
+
+Médias de $R^2$ por mês:
+
+```{r}
+rowMeans(r2)
+```
+
+Naturalmente, quanto mais distante a predição, menor o coeficiente de determinação. Dada a dificuldade de se prever 5 meses à frente tendo-se apenas, e no máximo, 37 meses anteriores disponíveis, os valores de coeficiente de determinação são muito satisfatórios, e encorajam o uso da metodologia "Clusterização + Regressão de meses anteriores" para um momento posterior em que hajam mais informações disponíveis.
 
 (**EDA**) Observemos as distribuições e a sumarização das variações de TPV desde Julho:
 
@@ -1340,4 +1372,4 @@ A presença de valores negativos de TPV torna sem sentido uma variação percent
 
 - Fatores macroeconômicos, como inflação e taxa básica de juros: dado que o faturamento é profundamente impactado tanto pelo poder de compra da população quanto pela facilidade de acesso a crédito por parte do empresário, seria interessante adicionar preditores que descrevessem esse contexto.
 
-- Desempenho de empresas do setor na Bolsa de Valores: por conta da maior abundância de informações históricas e da ampla teoria já produzida a respeito de previsão de séries temporais financeiras, seria interessante realizar previsões para os setores (englobando os diversos ativos de cada setor) e incorporar tais previsões no modelo aqui requerido.
+- Desempenho de empresas do setor na Bolsa de Valores: por conta da maior abundância de informações históricas e da ampla teoria já produzida a respeito de previsão de séries temporais financeiras, seria interessante realizar previsões para os segmentos de macroclassificação (englobando os diversos ativos de cada setor) e incorporar tais previsões como variáveis do modelo aqui prototipado.
